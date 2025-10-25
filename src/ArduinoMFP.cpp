@@ -307,40 +307,134 @@ uint8_t* ArduinoMFP::getImageBuffer() const {
 }
 
 
-uint8_t* ArduinoMFP::scan(int height, int width, const char* origin, const char* url, int port, const char* format, int filesystem = -1) {
+uint8_t* ArduinoMFP::scan(
+    int height, int width,
+    const char* origin,
+    const char* url,
+    int port,
+    const char* format,
+    const char* protocol,   // ✅ new parameter: "wsd" or "escl"
+    int filesystem
+) {
     freeImageBuffer();
     imageSize = 0;
-
     String host(url);
 
-    String jobUUID, jobId, jobToken;
+    // --- eSCL (AirScan) branch ---
+    if (String(protocol).equalsIgnoreCase("escl")) {
+        Serial.println("🟢 Using eSCL protocol...");
 
-    if (!createScanJob(host, port, height, width, String(origin), String(format), jobUUID, jobId, jobToken)) {
-        return nullptr;
-    }
+        String baseURL = "http://" + host + ":" + String(port) + "/eSCL/";
 
-    if (!retrieveImage(host, port, jobUUID, jobId, jobToken)) {
-        return nullptr;
-    }
+        // Build ScanSettings XML (you can adjust ColorMode, etc)
+        String scanXML =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<scan:ScanSettings xmlns:scan=\"http://schemas.hp.com/imaging/escl/2011/05/03\" "
+            "xmlns:pwg=\"http://www.pwg.org/schemas/2010/12/sm\">"
+              "<pwg:Version>2.6</pwg:Version>"
+              "<pwg:ScanRegions>"
+                "<pwg:ScanRegion>"
+                  "<pwg:XOffset>0</pwg:XOffset>"
+                  "<pwg:YOffset>0</pwg:YOffset>"
+                  "<pwg:Width>" + String(width) + "</pwg:Width>"
+                  "<pwg:Height>" + String(height) + "</pwg:Height>"
+                  "<pwg:ContentRegionUnits>escl:HundredthsOfInches</pwg:ContentRegionUnits>"
+                "</pwg:ScanRegion>"
+              "</pwg:ScanRegions>"
+              "<scan:InputSource>" + String(origin) + "</scan:InputSource>"
+              "<scan:ColorMode>RGB24</scan:ColorMode>"
+              "<scan:XResolution>300</scan:XResolution>"
+              "<scan:YResolution>300</scan:YResolution>"
+              "<scan:DocumentFormat>" + String(format) + "</scan:DocumentFormat>"
+            "</scan:ScanSettings>";
 
-    if (filesystem == 0 || filesystem == 1) {
-        File filePtr;
+        HTTPClient http;
+        String scanURL = baseURL + "ScanJobs";
+        http.begin(scanURL);
+        http.addHeader("Content-Type", "text/xml");
 
-        if (filesystem == 0) {
-            filePtr = SPIFFS.open("/scan.jpg", FILE_WRITE);
+        int postCode = http.POST(scanXML);
+        if (postCode == 201 || postCode == 200) {
+            String location = http.header("Location");
+            Serial.println("✅ eSCL ScanJob created at: " + location);
+
+            // --- Retrieve the image ---
+            HTTPClient imgClient;
+            imgClient.begin(location);
+            int imgCode = imgClient.GET();
+
+            if (imgCode == 200) {
+                int len = imgClient.getSize();
+                WiFiClient* stream = imgClient.getStreamPtr();
+
+                const size_t chunk = 1024;
+                size_t alloc = chunk;
+                imageBuffer = new uint8_t[alloc];
+                imageSize = 0;
+
+                while (imgClient.connected() && len > 0) {
+                    uint8_t buf[chunk];
+                    size_t bytes = stream->readBytes(buf, min(chunk, (size_t)len));
+                    if (bytes == 0) break;
+                    if (imageSize + bytes > alloc) {
+                        alloc += chunk;
+                        uint8_t* newBuf = new uint8_t[alloc];
+                        memcpy(newBuf, imageBuffer, imageSize);
+                        delete[] imageBuffer;
+                        imageBuffer = newBuf;
+                    }
+                    memcpy(imageBuffer + imageSize, buf, bytes);
+                    imageSize += bytes;
+                    len -= bytes;
+                }
+                Serial.printf("📸 eSCL scan complete — %d bytes\n", imageSize);
+                imgClient.end();
+            } else {
+                Serial.printf("❌ Failed to get eSCL image (%d)\n", imgCode);
+            }
         } else {
-            filePtr = LittleFS.open("/scan.jpg", FILE_WRITE);
+            Serial.printf("❌ eSCL scan job failed (%d)\n", postCode);
+            Serial.println(http.getString());
         }
+        http.end();
+    }
 
-        if (!filePtr) {
-            Serial.println("Failed to open file for writing");
+    // --- WSD branch ---
+    else if (String(protocol).equalsIgnoreCase("wsd")) {
+        Serial.println("🟠 Using WSD protocol...");
+
+        String jobUUID, jobId, jobToken;
+        if (!createScanJob(host, port, height, width, String(origin), String(format),
+                           jobUUID, jobId, jobToken)) {
+            Serial.println("❌ WSD CreateScanJob failed.");
             return nullptr;
         }
 
-        filePtr.write(imageBuffer, imageSize);
-        filePtr.close();
+        if (!retrieveImage(host, port, jobUUID, jobId, jobToken)) {
+            Serial.println("❌ WSD RetrieveImage failed.");
+            return nullptr;
+        }
 
-        Serial.println("Image saved to filesystem");
+        Serial.printf("📸 WSD scan complete — %d bytes\n", imageSize);
+    }
+
+    else {
+        Serial.println("⚠️ Unknown protocol! Use 'wsd' or 'escl'.");
+        return nullptr;
+    }
+
+    // --- Optional: save to filesystem ---
+    if (filesystem == 0 || filesystem == 1) {
+        File filePtr = (filesystem == 0)
+                           ? SPIFFS.open("/scan.jpg", FILE_WRITE)
+                           : LittleFS.open("/scan.jpg", FILE_WRITE);
+        if (filePtr) {
+            filePtr.write(imageBuffer, imageSize);
+            filePtr.close();
+            Serial.println("💾 Image saved to filesystem");
+        } else {
+            Serial.println("⚠️ Failed to open file for writing");
+        }
     }
 
     return imageBuffer;
@@ -424,6 +518,7 @@ String ArduinoMFP::supported(const char* url, int port) {
   String host = String(url);
   String uuid = "uuid:12345678-1234-1234-1234-123456789abc";
 
+  // --- Step 1: Send SOAP request to check WSD metadata ---
   String soapBody =
     "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
     "<soap:Envelope xmlns:soap=\"http://www.w3.org/2003/05/soap-envelope\""
@@ -446,44 +541,64 @@ String ArduinoMFP::supported(const char* url, int port) {
     "Connection: close\r\n\r\n" +
     soapBody;
 
-  if (!client.connect(url, port)) {
-    return "{\"error\": \"connection failed\"}";
-  }
+  bool wsdOk = false;
+  bool esclOk = false;
+  String response = "";
 
-  client.print(request);
+  // --- Try WSD first ---
+  if (client.connect(url, port)) {
+    client.print(request);
 
-  unsigned long timeout = millis();
-  while (client.connected() && !client.available()) {
-    if (millis() - timeout > 5000) {
-      client.stop();
-      return "{\"error\": \"timeout waiting for response\"}";
+    unsigned long timeout = millis();
+    while (client.connected() && !client.available()) {
+      if (millis() - timeout > 4000) break;
+      delay(10);
     }
-    delay(10);
+
+    while (client.available()) response += client.readString();
+    client.stop();
+
+    if (response.indexOf("ModelName") != -1 || response.indexOf("wsdp:ThisModel") != -1) {
+      wsdOk = true;
+    }
   }
 
-  String response;
-  while (client.available()) {
-    response += client.readString();
-  }
-  client.stop();
+  // --- If WSD failed, try eSCL ---
+  if (!wsdOk) {
+    WiFiClient esclClient;
+    String esclResponse = "";
+    if (esclClient.connect(url, port)) {
+      esclClient.print(
+        "GET /eSCL/ScannerStatus HTTP/1.1\r\n"
+        "Host: " + String(url) + ":" + String(port) + "\r\n"
+        "Connection: close\r\n\r\n"
+      );
+      unsigned long timeout = millis();
+      while (esclClient.connected() && !esclClient.available() && millis() - timeout < 4000) delay(10);
+      while (esclClient.available()) esclResponse += esclClient.readString();
+      esclClient.stop();
 
-  // --- Improved Extract Helper (handles xml:lang, namespaces, etc.) ---
+      if (esclResponse.indexOf("ScannerStatus") != -1 || esclResponse.indexOf("eSCL") != -1) {
+        esclOk = true;
+        response = esclResponse; // use this instead of WSD data
+      }
+    }
+  }
+
+  // --- Helper for tag extraction ---
   auto extractAnyTag = [](const String& xml, const char* const tags[], int tagCount) {
     for (int i = 0; i < tagCount; i++) {
       String tag = String(tags[i]);
       String base = tag;
       int colon = tag.indexOf(':');
-      if (colon != -1) base = tag.substring(colon + 1);  // e.g. wsdp:ModelName → ModelName
-
-      // Try full tag form (<wsdp:ModelName ...>value</wsdp:ModelName>)
+      if (colon != -1) base = tag.substring(colon + 1);
       int open = xml.indexOf("<" + tag);
       if (open != -1) {
         open = xml.indexOf(">", open);
         if (open != -1) {
           open++;
           int close = xml.indexOf("</" + base + ">", open);
-          if (close == -1)
-            close = xml.indexOf("</" + tag + ">", open);
+          if (close == -1) close = xml.indexOf("</" + tag + ">", open);
           if (close != -1) {
             String result = xml.substring(open, close);
             result.trim();
@@ -491,8 +606,6 @@ String ArduinoMFP::supported(const char* url, int port) {
           }
         }
       }
-
-      // Try namespace-free form (<ModelName ...>value</ModelName>)
       open = xml.indexOf("<" + base);
       if (open != -1) {
         open = xml.indexOf(">", open);
@@ -510,16 +623,16 @@ String ArduinoMFP::supported(const char* url, int port) {
     return String("");
   };
 
-  // --- Extract fields ---
-  const char* modelTags[] = {"wsdp:ModelName", "pnpx:ModelName", "df:ModelName", "ModelName"};
-  const char* modelUrlTags[] = {"wsdp:ModelUrl", "pnpx:ModelUrl", "df:ModelUrl", "ModelUrl"};
+  // --- Extract data from whichever protocol responded ---
+  const char* modelTags[] = {"wsdp:ModelName", "ModelName"};
+  const char* modelUrlTags[] = {"wsdp:ModelUrl", "ModelUrl"};
+  const char* addrTags[] = {"wsa:Address", "Address"};
 
-  String modelName = extractAnyTag(response, modelTags, 4);
-  String modelUrl  = extractAnyTag(response, modelUrlTags, 4);
-
-  // --- Find printer/scanner URLs ---
+  String modelName = extractAnyTag(response, modelTags, 2);
+  String modelUrl  = extractAnyTag(response, modelUrlTags, 2);
   String printerUrl = "";
   String scannerUrl = "";
+
   int pos = 0;
   while ((pos = response.indexOf("<wsdp:Hosted>", pos)) != -1 ||
          (pos = response.indexOf("<Hosted>", pos)) != -1) {
@@ -527,22 +640,25 @@ String ArduinoMFP::supported(const char* url, int port) {
     if (end == -1) end = response.indexOf("</Hosted>", pos);
     if (end == -1) break;
     String block = response.substring(pos, end);
-
-    const char* addrTags[] = {"wsa:Address", "Address"};
     if (block.indexOf("PrinterService") != -1)
       printerUrl = extractAnyTag(block, addrTags, 2);
     if (block.indexOf("ScannerService") != -1)
       scannerUrl = extractAnyTag(block, addrTags, 2);
-
     pos = end + 1;
   }
 
-  // --- Return JSON summary ---
+  // --- Decide protocol ---
+  String protocol = "unknown";
+  if (wsdOk) protocol = "WSD";
+  else if (esclOk) protocol = "eSCL";
+
+  // --- Build final JSON summary ---
   String json = "{";
   json += "\"modelName\": \"" + modelName + "\", ";
   json += "\"modelUrl\": \"" + modelUrl + "\", ";
   json += "\"printerService\": \"" + printerUrl + "\", ";
-  json += "\"scannerService\": \"" + scannerUrl + "\"";
+  json += "\"scannerService\": \"" + scannerUrl + "\", ";
+  json += "\"protocol\": \"" + protocol + "\"";
   json += "}";
 
   return json;
